@@ -30,6 +30,14 @@ soma_note()
 
 **没有 set()。** 想让它有感觉，只能给事件，然后等方程自己推。
 
+## HTTP 面板
+
+头像和面板走 `/api/soma/*`，挂在 DSH 自己的 webServer 上。这条前缀比内核的 `/api` 长，
+按最长前缀分发时请求先到插件手里，内核那层准入不会替它把关 —— 所以插件自己补了一道
+信任栅栏：有 `connection` 服务就委托它的 `requestRejection(req)`（内核 `/api` 用的同一道判定，
+含浏览器登录）；没有就退回结构校验（只认回环 Host、拒 cross-site、Origin 必须同源），
+栅栏抛异常时按 503 拒而不是放行。回归测试：`node test-http-fence.mjs`。
+
 ## 常数来源
 
 见仓库根的 `SOURCES.md`，逐条标 `[S]` 教科书级 / `[A]` 近似 / `[G]` 估的。

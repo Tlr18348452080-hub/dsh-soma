@@ -1,6 +1,6 @@
 {
   "name": "dsh-soma",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "给 AI 一副会自己演化的身体：触觉、温度、疲劳、饥饿全走生理与物理方程",
   "type": "module",
   "main": "lib/index.js",

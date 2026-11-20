@@ -25,6 +25,87 @@ const DEFAULTS = {
 /** 一次最多补推多久。手机睡一觉醒来，别把整夜算成一步。 */
 const MAX_CATCHUP_S = 6 * 3600
 
+/* ───────── /api/soma 的信任栅栏 ─────────
+   这条前缀比内核自己的 /api 长，服务器按最长前缀分发，所以请求先到我们手里，
+   内核那层准入（Host/Origin 校验 + 浏览器登录）不会替这条路由把关。
+   不补的话，浏览器里任意一个页面都能 POST /api/soma/config 改它、传图。
+   做法与内核一致：能拿到 connection 服务就委托它的 requestRejection(req)，
+   那就是内核 /api 自己用的判定；它抛异常时按 503 拒，绝不静默放行。
+   拿不到（老版本 DSH 没这个服务）就退回结构校验，照样 fail-closed：
+   只认回环 Host、拒绝 cross-site 与跨源 Origin。
+   返回要拒绝的状态码，放行返回 undefined。*/
+export function somaHttpRejection(req, connectionSource) {
+  let conn
+  try {
+    conn = typeof connectionSource === 'function' ? connectionSource() : connectionSource
+  } catch {
+    conn = undefined
+  }
+  const hasFence = !!conn && (typeof conn.requestRejection === 'function' || typeof conn.admit === 'function')
+
+  // ① 结构校验先跑，两条与「谁算自己人」无关的判定永远生效：
+  //    cross-site 一律拒、带 Origin 时必须与 Host 同源。
+  //    Host 是不是本机这一条在宿主栅栏可用时交给它判 —— 它知道 --trusted-host 配了谁，
+  //    我们自己再卡回环会把正经的反代/局域网部署拦死。
+  const structural = structuralRejection(req, hasFence)
+  if (structural !== undefined) return structural
+
+  // ② 宿主自己的判定（就是内核 /api 用的那一道，里面还有浏览器登录）。
+  //    0.1.7 起叫 admit({rejection})，之前的版本叫 requestRejection(→status)。
+  if (hasFence) {
+    try {
+      if (typeof conn.requestRejection === 'function') {
+        const code = conn.requestRejection(req)
+        if (code === undefined || code === null || code === false) return undefined
+        return typeof code === 'number' ? code : 403
+      }
+      const decision = conn.admit(req)
+      const code = decision && typeof decision === 'object' ? decision.rejection : undefined
+      if (code === undefined || code === null || code === false) return undefined
+      return typeof code === 'number' ? code : 403
+    } catch (e) {
+      // 栅栏自己坏了不能当成「没被拒」——那正是跨站请求最想要的放行。
+      console.error('[soma] 信任栅栏出错，按拒绝处理:', e?.message)
+      return 503
+    }
+  }
+
+  return undefined
+}
+
+/** 结构校验：Host 回环（仅在没有宿主栅栏时强判）、非 cross-site、Origin 同源。 */
+function structuralRejection(req, hostJudgedElsewhere) {
+  try {
+    const headers = (req && req.headers) || {}
+    const authority = String(headers.host || '')
+    if (!hostJudgedElsewhere && !isLoopbackAuthority(authority)) return 403
+    const site = String(headers['sec-fetch-site'] || '').toLowerCase()
+    if (site === 'cross-site') return 403
+    const origin = headers.origin
+    if (typeof origin === 'string' && origin && origin !== 'null') {
+      let originHost = ''
+      try { originHost = new URL(origin).host } catch { return 403 }
+      if (originHost.toLowerCase() !== authority.toLowerCase()) return 403
+      // 宿主栅栏可用时 Host 没验回环，这里至少要求它是个能解析的权威。
+      if (hostJudgedElsewhere && !authority) return 403
+    }
+    return undefined
+  } catch {
+    return 403
+  }
+}
+
+/** localhost / *.localhost / 127.0.0.0/8 / ::1 —— 逐段校验，防 `127.0.0.1.evil.com`。 */
+function isLoopbackAuthority(authority) {
+  let host = ''
+  try { host = new URL('http://' + authority).hostname.toLowerCase() } catch { return false }
+  host = host.replace(/^\[/, '').replace(/\]$/, '')
+  if (host === 'localhost' || host.endsWith('.localhost')) return true
+  if (host === '::1') return true
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
+  return !!m && Number(m[1]) === 127 && m.slice(2).every((x) => Number(x) <= 255)
+}
+
 export function apply(root, config = {}) {
   const cfg = { ...DEFAULTS, ...config }
   const soma = new Soma({ weight: cfg.weight, ear: true, eye: true })
@@ -435,11 +516,25 @@ export function apply(root, config = {}) {
   root.inject(['webServer'], (ctx) => {
     const server = ctx.webServer || (typeof ctx.get === 'function' ? ctx.get('webServer') : undefined)
     if (!server || typeof server.register !== 'function') return
+    // connection 服务要等浏览器登录那套异步初始化完才发布，比 webServer 晚；
+    // 挂载时读一次会永远读到 undefined，而结构校验只认回环 —— 所以每次请求现取。
+    const connection = () => {
+      try { return ctx.get('connection') ?? ctx.connection } catch { return undefined }
+    }
     try {
       ctx.effect(() => server.register({
         kind: 'prefix',
         path: '/api/soma',
         handler: (req, res) => {
+          // 守卫放在最前面：这些路由先于内核 /api 的准入命中，得自己把关。
+          const denied = somaHttpRejection(req, connection)
+          if (denied !== undefined) {
+            try {
+              res.writeHead(denied, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+              res.end('rejected')
+            } catch { /* 已经回过了 */ }
+            return
+          }
           Promise.resolve().then(async () => {
             const url = new URL(req.url || '/', 'http://x')
             // 把当前那张图吐回去，设置页才能给人看「已经设了」
