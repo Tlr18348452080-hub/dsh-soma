@@ -1,4 +1,8 @@
-# soma —— 给 AI 一副会自己演化的身体
+# dsh-soma — 给 AI 一副会自己演化的身体
+
+> **A body for AI that actually tires.** Touch, temperature, fatigue, hunger and hormones are integrated as differential equations; the model sees one `[body]` line in its system prompt and cannot set a feeling — only send events (newtons, °C, cm/s) and wait for the physics. A DeepSeek Harness plugin, plain Node with zero dependencies.
+
+装上之后，DSH 插件市场里搜 **dsh-soma**，或者直接从这个仓库装 `plugin/`。
 
 不是"模拟触觉"，也不是又一个人格插件。
 
